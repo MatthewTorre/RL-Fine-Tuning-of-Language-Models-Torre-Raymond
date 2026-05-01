@@ -77,14 +77,126 @@ def train(
     gradient_accumulation_steps=1, 
     gradient_clipping=1.0
 ):
-    # TODO(student): implement the SFT optimization loop.
-    # Expected high-level flow:
-    # 1) Forward pass on `input_ids` and compute token-level log-probs.
-    # 2) Mask loss to response tokens only using `is_response_token`.
-    # 3) Backprop, optionally clip gradients, then optimizer/scheduler steps.
-    # 4) Periodically evaluate on `test_dataloader` and log metrics to W&B.
-    # 5) Save checkpoints under `output_dir` when requested.
-    raise NotImplementedError("SFT is not implemented for the student project")
+    #
+    # Objective (Eq. 6 in spec):
+    #   max_theta  E_{x,y in D}  sum_{t=1}^{|y|}  log pi_theta(y_t | x, y_{<t})
+    # e.g,minimize cross-entropy loss but (only) on completion (response) tokens.
+    #
+    # Each batch dict has three tensors:
+    #   input_ids         (B, prompt_len + response_len) -> move to device before passing to model
+    #   attention_mask    (B, prompt_len + response_len)  1=real token, 0=pad
+    #   is_response_token (B, prompt_len + response_len) -> 1=response token, 0=prompt token
+    #
+   
+
+    # count epochs
+    for epoch in range(num_epochs):
+        #  gets batches from the dataloader for every epoch
+        for batch_idx, batch in enumerate(train_dataloader):
+
+            # for each batch dict, we have 3 different tensors
+            # Move tensors to `device`.
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            is_response_token = batch['is_response_token'].to(device)
+
+            # step 1, forward pass
+            model_output = model(input_ids=input_ids, attention_mask=attention_mask)    
+            logits = model_output.logits
+
+
+            # autoregressive model so logits are used to predict the nexttoken
+            response_pred_logits = logits[:, :-1, :]
+            nt_labels = input_ids[:, 1:] # ground truth taken at each next position
+            to_mask = is_response_token[:, 1:]
+
+            # step 3; PER-TOKEN CROSS-ENTROPY
+            #   Use F.cross_entropy(reduction='none') on flattened logits/labels.
+
+            # reshaping results back to (B, L-1)
+            B, L_minus_1, vocab_size = response_pred_logits.shape
+            flat_logits = response_pred_logits.view(-1, vocab_size)   # (B*(L-1), vocab_size)
+            flat_labels = nt_labels.view(-1)                          # (B*(L-1),)
+
+            loss_per_token = F.cross_entropy(flat_logits, flat_labels, reduction='none')  
+            loss_per_token = loss_per_token.view(response_pred_logits.size(0), -1)
+
+
+            # step 4 MASK TO RESPONSE TOKENS ONLY & AVERAGE
+            masked_loss = (loss_per_token * to_mask)  # prompt positions become 0
+
+            # average and divide by the actual number of response token, microbatch loss must be scaled appropriately
+            num_response_tokens = to_mask.sum()  # total number of response tokens in the batch
+            loss = masked_loss.sum() /  num_response_tokens
+            loss = loss/ gradient_accumulation_steps
+
+
+            # step 5 TOKEN ACCURACY (metric, no gradient needed)
+            with torch.no_grad():
+                pred_tokens = response_pred_logits.argmax(dim=-1)
+                truth = (pred_tokens == nt_labels)
+                token_accuracy = (truth * to_mask).sum() / to_mask.sum()
+
+            train_loss = loss.item()
+            train_token_accuracy = token_accuracy.item()
+
+            # step 6 BACKWARD
+            loss.backward()
+
+            # STEP 7: OPTIMIZER STEP (only on gradient accumulation boundary)
+            if (batch_idx + 1) % gradient_accumulation_steps == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clipping)
+                optimizer.step()
+                # adjusts the lr according to schedule
+                scheduler.step()
+
+                # clear all accum grads back to zero for new microbatch
+                optimizer.zero_grad()
+
+        # EVALUATION (after each epoch)
+        model.eval()
+        test_losses = []
+        test_accuracies = []
+        with torch.no_grad():
+            for batch in test_dataloader:
+                input_ids = batch['input_ids'].to(device)
+                attention_mask = batch['attention_mask'].to(device)
+                is_response_token = batch['is_response_token'].to(device)
+
+                model_output = model(input_ids=input_ids, attention_mask=attention_mask)
+                logits = model_output.logits
+
+                response_pred_logits = logits[:, :-1, :]
+                nt_labels = input_ids[:, 1:]
+                to_mask = is_response_token[:, 1:]
+
+                B, L_minus_1, vocab_size = response_pred_logits.shape
+                flat_logits = response_pred_logits.view(-1, vocab_size)
+                flat_labels = nt_labels.view(-1)
+
+                loss_per_token = F.cross_entropy(flat_logits, flat_labels, reduction='none')
+                loss_per_token = loss_per_token.view(response_pred_logits.size(0), -1)
+
+                masked_loss = (loss_per_token * to_mask)
+                num_response_tokens = to_mask.sum()
+                loss = masked_loss.sum() / num_response_tokens
+
+                pred_tokens = response_pred_logits.argmax(dim=-1)
+                truth = (pred_tokens == nt_labels)
+                token_accuracy = (truth * to_mask).sum() / to_mask.sum()
+
+                test_losses.append(loss.item())
+                test_accuracies.append(token_accuracy.item())
+
+        model.train()
+
+        # LOGGING to W&B  (Section 4.2.2 needs these required metrics)
+        wandb.log({"train/loss": train_loss, "train/token_accuracy": train_token_accuracy})
+        wandb.log({"test/loss": sum(test_losses) / len(test_losses), "test/token_accuracy": sum(test_accuracies) / len(test_accuracies)})
+
+        # check pointing
+        if save_model:
+            save_checkpoint(model, tokenizer, optimizer, scheduler, output_dir)
 
 def main():
     parser = argparse.ArgumentParser()

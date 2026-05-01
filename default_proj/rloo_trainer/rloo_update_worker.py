@@ -207,13 +207,82 @@ class RLOOUpdateWorker:
         device='cuda',
     ):
         # TODO(student): implement one RLOO policy update.
-        # Inputs arrive flattened as [batch_size * group_size, seq_len].
-        # Required pieces:
-        # 1) Compute per-token log-probs on target tokens under current policy.
-        # 2) Build leave-one-out baseline within each response group.
-        # 3) Compute policy-gradient loss using advantages (and importance weights
-        #    if sample_log_probs are provided).
-        # 4) Add entropy regularization and optional KL penalty to ref model.
-        # 5) Backward pass; if `is_update_step`, clip and step optimizer/scheduler.
-        # 6) Return scalar metrics used by trainer logging.
+        #
+        # Objective (Eq. 10 in spec) -- RLOO policy gradient:
+        #   (1/k) * sum_i [ R(y^i, x) - (1/(k-1)) * sum_{j != i} R(y^j, x) ]
+        #                * grad log pi(y^i | x)
+        # where y^1,...,y^k ~ pi_theta(.|x) are k=group_size responses per prompt.
+        #
+        # With importance weighting (Eq. 11) since vLLM and HF may differ:
+        #   w(y, x) = exp( log pi_theta(y|x) - log mu(y|x) )  clipped to max value
+        # Multiply each advantage by its importance weight before forming the loss.
+        #
+        # -----------------------------------------------------------------------
+        # SETUP
+        # -----------------------------------------------------------------------
+        # Inputs arrive as numpy arrays of shape [batch_size * group_size, seq_len].
+        # Convert all numpy arrays to torch tensors and move to `device`.
+        #   input_ids         (N, L)  where N = batch_size * group_size
+        #   attention_mask    (N, L)
+        #   is_response_token (N, L)  1=response, 0=prompt
+        #   rewards           (N,)    scalar reward per response
+        #   sample_log_probs  (N,)    log mu(y|x) from vLLM sampling
+        #
+        # STEP 1 -- FORWARD PASS & PER-TOKEN LOG-PROBS
+        #   logits = model(input_ids, attention_mask).logits     shape (N, L, vocab)
+        #   Shift by 1: shift_logits (N, L-1, vocab), shift_labels (N, L-1), shift_mask (N, L-1).
+        #   log_probs_per_token = F.log_softmax(shift_logits, dim=-1) gathered at shift_labels.
+        #   Apply shift_mask; sum over response tokens -> sequence_logps  shape (N,)
+        #
+        # STEP 2 -- IMPORTANCE WEIGHTS  (Eq. 11)
+        #   log_ratio = sequence_logps - sample_log_probs    shape (N,)
+        #   importance_weights = log_ratio.exp().clamp(max=some_clip_value)
+        #   importance_weight_mean = importance_weights.mean()  <- log this metric
+        #
+        # STEP 3 -- LEAVE-ONE-OUT BASELINE  (Eq. 10)
+        #   Reshape rewards to (batch_size_prompts, group_size).
+        #   For each sample i in a group, baseline_i = mean of rewards of all j != i.
+        #     baseline = (rewards.sum(dim=1, keepdim=True) - rewards) / (group_size - 1)
+        #   advantages = rewards - baseline    shape (batch_size_prompts, group_size)
+        #   Flatten back to (N,).
+        #
+        # STEP 4 -- POLICY GRADIENT LOSS
+        #   pg_loss = -mean( importance_weights * advantages * sequence_logps )
+        #   Scale by (1 / gradient_accumulation_steps).
+        #
+        # STEP 5 -- ENTROPY REGULARIZATION (optional, if entropy_coefficient > 0)
+        #   token_probs = shift_logits.softmax(dim=-1)
+        #   entropy_per_token = -(token_probs * log_probs_all_tokens).sum(dim=-1)
+        #   Apply shift_mask; average over response tokens -> mean_entropy
+        #   entropy_loss = -entropy_coefficient * mean_entropy
+        #   Add entropy_loss to total loss.
+        #
+        # STEP 6 -- KL PENALTY (optional, if kl_divergence_coefficient > 0)
+        #   with torch.no_grad(): ref_logits = ref_model(input_ids, attention_mask).logits
+        #   kl_per_token = F.kl_div(policy_log_probs, ref_probs, reduction='none').sum(-1)
+        #   Apply shift_mask; average -> mean_kl
+        #   kl_loss = kl_divergence_coefficient * mean_kl
+        #   Add kl_loss to total loss.
+        #   Log kl_loss as a metric.
+        #
+        # STEP 7 -- BACKWARD
+        #   total_loss.backward()
+        #
+        # STEP 8 -- OPTIMIZER STEP (only if is_update_step)
+        #   if is_update_step:
+        #       torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clipping)
+        #       optimizer.step()
+        #       scheduler.step()
+        #       optimizer.zero_grad()
+        #
+        # -----------------------------------------------------------------------
+        # RETURN METRICS DICT  (Section 4.3.2 required metrics)
+        # -----------------------------------------------------------------------
+        #   return {
+        #       "rloo_loss":              float,
+        #       "importance_weight_mean": float,   <- mean of w(y,x) across batch
+        #       "kl_loss":                float,   <- 0.0 if kl_divergence_coefficient == 0
+        #       "rollout_accuracy":       float,   <- mean(rewards) over the batch
+        #       "lr":                     float,   <- scheduler.get_last_lr()[0]
+        #   }
         raise NotImplementedError("This function is not implemented")

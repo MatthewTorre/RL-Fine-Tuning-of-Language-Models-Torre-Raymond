@@ -89,11 +89,71 @@ def train(
     loss_type='ipo',
 ):
     # TODO(student): implement IPO/DPO-style pairwise optimization.
-    # Expected high-level flow:
-    # 1) Compute policy log-probs for chosen/rejected responses.
-    # 2) Compute frozen-reference log-probs for chosen/rejected responses.
-    # 3) Build the pairwise objective (IPO or related variant).
-    # 4) Apply gradient accumulation, clipping, logging, and checkpointing.
+    #
+    # Objective (Eq. 9 in spec) -- IPO:
+    #   L_IPO = || h^{yw,yl}_{pi_theta} - (2*beta)^{-1} ||_2^2
+    #   where h = [log pi_theta(yw|x) - log pi_ref(yw|x)]
+    #           - [log pi_theta(yl|x) - log pi_ref(yl|x)]
+    #
+    # The implicit reward for a single response (Eq. 7):
+    #   r_theta(x,y) = beta * (log pi_theta(y|x) - log pi_ref(y|x))
+    # So h = (1/beta) * (r_theta(x,yw) - r_theta(x,yl))
+    #
+    # -----------------------------------------------------------------------
+    # OUTER LOOP: for epoch in range(num_epochs): for batch in train_dataloader:
+    # -----------------------------------------------------------------------
+    #
+    # Each batch dict has six tensors (from ipo_dataset.py collate_fn):
+    #   input_ids_w / attention_mask_w / is_response_token_w   <- chosen
+    #   input_ids_l / attention_mask_l / is_response_token_l   <- rejected
+    #
+    # HELPER -- compute_sequence_logps(model, input_ids, attention_mask, is_response_token):
+    #   Run forward pass -> logits (B, L, vocab).
+    #   Shift by 1: shift_logits (B, L-1, vocab), shift_labels (B, L-1), shift_mask (B, L-1).
+    #   Per-token log-probs = F.log_softmax(shift_logits, dim=-1) gathered at shift_labels.
+    #   Mask to response tokens; sum (or average if average_logps=True) -> (B,) sequence logps.
+    #
+    # STEP 1 -- POLICY LOG-PROBS (with gradients)
+    #   logps_policy_w = compute_sequence_logps(model, input_ids_w, attention_mask_w, is_response_token_w)
+    #   logps_policy_l = compute_sequence_logps(model, input_ids_l, attention_mask_l, is_response_token_l)
+    #
+    # STEP 2 -- REFERENCE LOG-PROBS (no gradients, frozen model)
+    #   with torch.no_grad():
+    #       logps_ref_w = compute_sequence_logps(reference_model, input_ids_w, ...)
+    #       logps_ref_l = compute_sequence_logps(reference_model, input_ids_l, ...)
+    #
+    # STEP 3 -- IMPLICIT REWARD MARGIN  h  (Eq. 9)
+    #   h = (logps_policy_w - logps_ref_w) - (logps_policy_l - logps_ref_l)
+    #   reward_margin = h.mean()   <- log this as "IPO reward margin"
+    #
+    # STEP 4 -- IPO LOSS
+    #   ipo_loss = ((h - 1.0 / (2.0 * beta)) ** 2).mean()
+    #   Scale by (1 / gradient_accumulation_steps) before backward.
+    #
+    # STEP 5 -- BACKWARD
+    #   ipo_loss.backward()
+    #
+    # STEP 6 -- OPTIMIZER STEP (on gradient accumulation boundary)
+    #   torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clipping)
+    #   optimizer.step() ; scheduler.step() ; optimizer.zero_grad()
+    #
+    # -----------------------------------------------------------------------
+    # EVALUATION (after each epoch on test_dataloader)
+    # -----------------------------------------------------------------------
+    #   model.eval() ; torch.no_grad()
+    #   Repeat steps 1-4, accumulate test IPO loss and test reward margin.
+    #   model.train()
+    #
+    # -----------------------------------------------------------------------
+    # LOGGING to W&B  (Section 4.3.1 required metrics)
+    # -----------------------------------------------------------------------
+    #   wandb.log({"train/ipo_loss": ..., "train/reward_margin": ...})
+    #   wandb.log({"test/ipo_loss":  ..., "test/reward_margin":  ...})
+    #
+    # -----------------------------------------------------------------------
+    # CHECKPOINTING
+    # -----------------------------------------------------------------------
+    #   if save_model: call save_checkpoint(model, tokenizer, optimizer, scheduler, output_dir)
     raise NotImplementedError("This function is not implemented")
 
 def main():
