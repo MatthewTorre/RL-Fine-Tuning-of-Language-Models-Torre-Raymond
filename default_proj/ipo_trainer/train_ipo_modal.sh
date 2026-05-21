@@ -80,6 +80,7 @@ for i in "${!lrs[@]}"; do
         --loss_type "$curr_loss_type"
         --beta "$curr_beta"
         --average_logps "$average_logps"
+        --detach
     )
 
     printf 'Executing command: '

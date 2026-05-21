@@ -116,28 +116,35 @@ def train(
     average_logps=False,
     loss_type='ipo',
 ):
+    model.to(device)
+    reference_model.to(device)
+    reference_model.eval()
+
     for epoch in range(num_epochs):
-        for batch in train_dataloader:
-            input_ids_w = batch["inputs_ids_w"]
-            input_ids_l = batch["inputs_ids_l"]
-            attention_mask_w = batch["attention_mask_w"]
-            attention_mask_l = batch["attention_mask_l"]
-            is_response_token_w = batch["is_response_token_w"]
-            is_response_token_l = batch["is_response_token_l"]
+        model.train()
+        optimizer.zero_grad(set_to_none=True)
+
+        for step, batch in enumerate(train_dataloader):
+            input_ids_w = batch["input_ids_w"].to(device)
+            input_ids_l = batch["input_ids_l"].to(device)
+            attention_mask_w = batch["attention_mask_w"].to(device)
+            attention_mask_l = batch["attention_mask_l"].to(device)
+            is_response_token_w = batch["is_response_token_w"].to(device)
+            is_response_token_l = batch["is_response_token_l"].to(device)
 
             # STEP 1 -- POLICY LOG-PROBS (with gradients)
             # logps_policy_w = compute_sequence_logps(model, input_ids_w, attention_mask_w, is_response_token_w)
             # logps_policy_l = compute_sequence_logps(model, input_ids_l, attention_mask_l, is_response_token_l)
-            logps_policy_w = compute_sequence_logps(model, input_ids_w, attention_mask_w, is_response_token_w)
-            logps_policy_l = compute_sequence_logps(model, input_ids_l, attention_mask_l, is_response_token_l)
+            logps_policy_w = compute_sequence_logps(model, input_ids_w, attention_mask_w, is_response_token_w, average_logps=average_logps)
+            logps_policy_l = compute_sequence_logps(model, input_ids_l, attention_mask_l, is_response_token_l, average_logps=average_logps)
 
             # STEP 2 -- REFERENCE LOG-PROBS (no gradients, frozen model)
             #   with torch.no_grad():
             #       logps_ref_w = compute_sequence_logps(reference_model, input_ids_w, ...)
             #       logps_ref_l = compute_sequence_logps(reference_model, input_ids_l, ...)
             with torch.no_grad():
-                logps_ref_w = compute_sequence_logps(reference_model, input_ids_w, attention_mask_w, is_response_token_w)
-                logps_ref_l = compute_sequence_logps(reference_model, input_ids_l, attention_mask_l, is_response_token_l)
+                logps_ref_w = compute_sequence_logps(reference_model, input_ids_w, attention_mask_w, is_response_token_w, average_logps=average_logps)
+                logps_ref_l = compute_sequence_logps(reference_model, input_ids_l, attention_mask_l, is_response_token_l, average_logps=average_logps)
             
             # STEP 3 -- IMPLICIT REWARD MARGIN  h  (Eq. 9)
             #   h = (logps_policy_w - logps_ref_w) - (logps_policy_l - logps_ref_l)
@@ -153,64 +160,68 @@ def train(
 
             # STEP 5 -- BACKWARD
             #   ipo_loss.backward()
-            ipo_loss.backward()
+            train_ipo_loss.backward()
 
             # STEP 6 -- OPTIMIZER STEP (on gradient accumulation boundary)
             #   torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clipping)
             #   optimizer.step() ; scheduler.step() ; optimizer.zero_grad()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clipping)
-            optimizer.step()
-            scheduler.step()
-            optimizer.zero_grad()
+            if (step + 1) % gradient_accumulation_steps == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clipping)
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+            wandb.log({"train/ipo_loss": ipo_loss.detach().item(), "train/reward_margin": train_reward_margin.detach().item()})
         
-        # -----------------------------------------------------------------------
-        # EVALUATION (after each epoch on test_dataloader)
-        # -----------------------------------------------------------------------
-        #   model.eval() ; torch.no_grad()
-        #   Repeat steps 1-4, accumulate test IPO loss and test reward margin.
-        #   model.train()
-        with torch.no_grad():
-            for batch in test_dataloader:
-                input_ids_w = batch["inputs_ids_w"]
-                input_ids_l = batch["inputs_ids_l"]
-                attention_mask_w = batch["attention_mask_w"]
-                attention_mask_l = batch["attention_mask_l"]
-                is_response_token_w = batch["is_response_token_w"]
-                is_response_token_l = batch["is_response_token_l"]
-
-                # STEP 1 -- POLICY LOG-PROBS (with gradients)
-                # logps_policy_w = compute_sequence_logps(model, input_ids_w, attention_mask_w, is_response_token_w)
-                # logps_policy_l = compute_sequence_logps(model, input_ids_l, attention_mask_l, is_response_token_l)
-                logps_policy_w = compute_sequence_logps(model, input_ids_w, attention_mask_w, is_response_token_w)
-                logps_policy_l = compute_sequence_logps(model, input_ids_l, attention_mask_l, is_response_token_l)
-
-                # STEP 2 -- REFERENCE LOG-PROBS (no gradients, frozen model)
-                #   with torch.no_grad():
-                #       logps_ref_w = compute_sequence_logps(reference_model, input_ids_w, ...)
-                #       logps_ref_l = compute_sequence_logps(reference_model, input_ids_l, ...)
-                with torch.no_grad():
-                    logps_ref_w = compute_sequence_logps(reference_model, input_ids_w, attention_mask_w, is_response_token_w)
-                    logps_ref_l = compute_sequence_logps(reference_model, input_ids_l, attention_mask_l, is_response_token_l)
-                
-                # STEP 3 -- IMPLICIT REWARD MARGIN  h  (Eq. 9)
-                #   h = (logps_policy_w - logps_ref_w) - (logps_policy_l - logps_ref_l)
-                #   reward_margin = h.mean()   <- log this as "IPO reward margin"
-                h = (logps_policy_w - logps_ref_w) - (logps_policy_l - logps_ref_l)
-                test_reward_margin = h.mean()
-
-                # STEP 4 -- IPO LOSS
-                #   ipo_loss = ((h - 1.0 / (2.0 * beta)) ** 2).mean()
-                #   Scale by (1 / gradient_accumulation_steps) before backward.
-                ipo_loss = ((h - 1.0 / (2.0 * beta)) ** 2).mean()
-                test_ipo_loss = ipo_loss / gradient_accumulation_steps
-
             # -----------------------------------------------------------------------
-            # LOGGING to W&B  (Section 4.3.1 required metrics)
+            # EVALUATION (after each epoch on test_dataloader)
             # -----------------------------------------------------------------------
-            #   wandb.log({"train/ipo_loss": ..., "train/reward_margin": ...})
-            #   wandb.log({"test/ipo_loss":  ..., "test/reward_margin":  ...})
-            wandb.log({"train/ipo_loss": train_ipo_loss, "train/reward_margin": train_reward_margin})
-            wandb.log({"test/ipo_loss":  test_ipo_loss, "test/reward_margin":  test_reward_margin})
+            #   model.eval() ; torch.no_grad()
+            #   Repeat steps 1-4, accumulate test IPO loss and test reward margin.
+            #   model.train()
+            model.eval()
+            with torch.no_grad():
+                for batch in test_dataloader:
+                    input_ids_w = batch["input_ids_w"].to(device)
+                    input_ids_l = batch["input_ids_l"].to(device)
+                    attention_mask_w = batch["attention_mask_w"].to(device)
+                    attention_mask_l = batch["attention_mask_l"].to(device)
+                    is_response_token_w = batch["is_response_token_w"].to(device)
+                    is_response_token_l = batch["is_response_token_l"].to(device)
+
+                    # STEP 1 -- POLICY LOG-PROBS (with gradients)
+                    # logps_policy_w = compute_sequence_logps(model, input_ids_w, attention_mask_w, is_response_token_w)
+                    # logps_policy_l = compute_sequence_logps(model, input_ids_l, attention_mask_l, is_response_token_l)
+                    logps_policy_w = compute_sequence_logps(model, input_ids_w, attention_mask_w, is_response_token_w, average_logps=average_logps)
+                    logps_policy_l = compute_sequence_logps(model, input_ids_l, attention_mask_l, is_response_token_l, average_logps=average_logps)
+
+                    # STEP 2 -- REFERENCE LOG-PROBS (no gradients, frozen model)
+                    #   with torch.no_grad():
+                    #       logps_ref_w = compute_sequence_logps(reference_model, input_ids_w, ...)
+                    #       logps_ref_l = compute_sequence_logps(reference_model, input_ids_l, ...)
+                    logps_ref_w = compute_sequence_logps(reference_model, input_ids_w, attention_mask_w, is_response_token_w, average_logps=average_logps)
+                    logps_ref_l = compute_sequence_logps(reference_model, input_ids_l, attention_mask_l, is_response_token_l, average_logps=average_logps)
+                    
+                    # STEP 3 -- IMPLICIT REWARD MARGIN  h  (Eq. 9)
+                    #   h = (logps_policy_w - logps_ref_w) - (logps_policy_l - logps_ref_l)
+                    #   reward_margin = h.mean()   <- log this as "IPO reward margin"
+                    h = (logps_policy_w - logps_ref_w) - (logps_policy_l - logps_ref_l)
+                    test_reward_margin = h.mean()
+
+                    # STEP 4 -- IPO LOSS
+                    #   ipo_loss = ((h - 1.0 / (2.0 * beta)) ** 2).mean()
+                    #   Scale by (1 / gradient_accumulation_steps) before backward.
+                    ipo_loss = ((h - 1.0 / (2.0 * beta)) ** 2).mean()
+
+                # -----------------------------------------------------------------------
+                # LOGGING to W&B  (Section 4.3.1 required metrics)
+                # -----------------------------------------------------------------------
+                #   wandb.log({"train/ipo_loss": ..., "train/reward_margin": ...})
+                #   wandb.log({"test/ipo_loss":  ..., "test/reward_margin":  ...})
+                # Training + test loss and reward margin gets logged every batch, per Ed recommendation
+                # Test loss and reward margin only gets logged every epoch. 
+
+            
+                wandb.log({"test/ipo_loss":  ipo_loss.item(), "test/reward_margin":  test_reward_margin.item()})
 
             # -----------------------------------------------------------------------
             # CHECKPOINTING
