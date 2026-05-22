@@ -59,7 +59,7 @@ for i in "${!lrs[@]}"; do
     wandb_name="${WANDB_NAME_PREFIX:-loss${curr_loss_type}_lr${curr_lr}_beta${curr_beta}_ep${curr_epochs}}"
 
     command=(
-        modal run "$PROJECT_ROOT/modal_train.py"
+        modal run --detach "$PROJECT_ROOT/modal_train.py"
         ipo
         --model_name "$model_name"
         --dataset_name "$dataset_name"
@@ -80,7 +80,6 @@ for i in "${!lrs[@]}"; do
         --loss_type "$curr_loss_type"
         --beta "$curr_beta"
         --average_logps "$average_logps"
-        --detach
     )
 
     printf 'Executing command: '
