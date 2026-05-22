@@ -59,6 +59,7 @@ def _build_secret_list() -> list[modal.Secret]:
 
 base_image = (
     modal.Image.debian_slim(python_version="3.11")
+    .run_commands("echo 'cache-bust-v2'")
     .add_local_dir(str(LOCAL_PROJECT_ROOT), remote_path=str(REMOTE_PROJECT_ROOT), copy=True)
     .run_commands(
         (

@@ -87,7 +87,8 @@ def train(
     #   attention_mask    (B, prompt_len + response_len)  1=real token, 0=pad
     #   is_response_token (B, prompt_len + response_len) -> 1=response token, 0=prompt token
     #
-   
+
+    global_step = 0
 
     # count epochs
     for epoch in range(num_epochs):
@@ -101,7 +102,7 @@ def train(
             is_response_token = batch['is_response_token'].to(device)
 
             # step 1, forward pass
-            model_output = model(input_ids=input_ids, attention_mask=attention_mask)    
+            model_output = model(input_ids=input_ids, attention_mask=attention_mask)
             logits = model_output.logits
 
 
@@ -115,11 +116,11 @@ def train(
 
             # reshaping results back to (B, L-1)
             B, L_minus_1, vocab_size = response_pred_logits.shape
-            flat_logits = response_pred_logits.view(-1, vocab_size)   # (B*(L-1), vocab_size)
-            flat_labels = nt_labels.view(-1)                          # (B*(L-1),)
+            flat_logits = response_pred_logits.reshape(-1, vocab_size)   # (B*(L-1), vocab_size)
+            flat_labels = nt_labels.reshape(-1)                         # (B*(L-1),)
 
-            loss_per_token = F.cross_entropy(flat_logits, flat_labels, reduction='none')  
-            loss_per_token = loss_per_token.view(response_pred_logits.size(0), -1)
+            loss_per_token = F.cross_entropy(flat_logits, flat_labels, reduction='none')
+            loss_per_token = loss_per_token.reshape(response_pred_logits.size(0), -1)
 
 
             # step 4 MASK TO RESPONSE TOKENS ONLY & AVERAGE
@@ -137,7 +138,7 @@ def train(
                 truth = (pred_tokens == nt_labels)
                 token_accuracy = (truth * to_mask).sum() / to_mask.sum()
 
-            train_loss = loss.item()
+            train_loss = loss.item() * gradient_accumulation_steps  # unscale for logging
             train_token_accuracy = token_accuracy.item()
 
             # step 6 BACKWARD
@@ -152,6 +153,14 @@ def train(
 
                 # clear all accum grads back to zero for new microbatch
                 optimizer.zero_grad()
+
+                global_step += 1
+                wandb.log({
+                    "train/loss": train_loss,
+                    "train/token_accuracy": train_token_accuracy,
+                    "train/learning_rate": scheduler.get_last_lr()[0],
+                    "train/epoch": epoch,
+                }, step=global_step)
 
         # EVALUATION (after each epoch)
         model.eval()
@@ -171,11 +180,11 @@ def train(
                 to_mask = is_response_token[:, 1:]
 
                 B, L_minus_1, vocab_size = response_pred_logits.shape
-                flat_logits = response_pred_logits.view(-1, vocab_size)
-                flat_labels = nt_labels.view(-1)
+                flat_logits = response_pred_logits.reshape(-1, vocab_size)
+                flat_labels = nt_labels.reshape(-1)
 
                 loss_per_token = F.cross_entropy(flat_logits, flat_labels, reduction='none')
-                loss_per_token = loss_per_token.view(response_pred_logits.size(0), -1)
+                loss_per_token = loss_per_token.reshape(response_pred_logits.size(0), -1)
 
                 masked_loss = (loss_per_token * to_mask)
                 num_response_tokens = to_mask.sum()
@@ -191,8 +200,11 @@ def train(
         model.train()
 
         # LOGGING to W&B  (Section 4.2.2 needs these required metrics)
-        wandb.log({"train/loss": train_loss, "train/token_accuracy": train_token_accuracy})
-        wandb.log({"test/loss": sum(test_losses) / len(test_losses), "test/token_accuracy": sum(test_accuracies) / len(test_accuracies)})
+        wandb.log({
+            "test/loss": sum(test_losses) / len(test_losses),
+            "test/token_accuracy": sum(test_accuracies) / len(test_accuracies),
+            "train/epoch": epoch,
+        }, step=global_step)
 
         # check pointing
         if save_model:
