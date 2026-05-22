@@ -216,6 +216,7 @@ def train(
                 #   ipo_loss = ((h - 1.0 / (2.0 * beta)) ** 2).mean()
                 #   Scale by (1 / gradient_accumulation_steps) before backward.
                 ipo_loss = ((h - 1.0 / (2.0 * beta)) ** 2).mean()
+                ipo_loss = ipo_loss / gradient_accumulation_steps
 
                 # -----------------------------------------------------------------------
                 # LOGGING to W&B  (Section 4.3.1 required metrics)
