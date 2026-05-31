@@ -1,0 +1,230 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb}
+\usepackage{enumitem}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{float}
+
+\renewcommand{\maketitle}{
+  \begin{center}
+    {\bf \large
+SFT, IPO, and Elo-Curriculum RLOO\\for Verifier-Based Countdown Reasoning
+    }
+    \vspace{0.2cm}
+
+    {\bf Team Members:}\\
+    Matthew Torre, Donnie Raymond\\[0.1cm]
+
+    {\bf Emails:}\\
+    mtorre04@stanford.edu, raymondd@stanford.edu
+  \end{center}
+}
+
+\begin{document}
+
+\maketitle
+
+\section{Project Proposal}
+
+\subsection{Extension}
+
+For our extension, we propose a novel approach to curriculum learning for reinforcement learning fine-tuning on the Countdown arithmetic reasoning task. The default project trains a Qwen 2.5 0.5B model using supervised fine-tuning (SFT), preference optimization (IPO), and online RLOO with a rule-based verifier reward on Countdown prompts. Our extension modifies only the RLOO stage by replacing uniform prompt sampling with an easier-to-harder curriculum over Countdown problems.
+
+Countdown provides a natural testbed for curriculum RL because the reward is sparse: a sampled solution receives full credit only when the model produces a correctly formatted arithmetic expression that uses each provided number exactly once and evaluates to the target. Early in RL training, many sampled rollouts receive zero or near-zero reward, which makes policy-gradient updates noisy and inefficient. A curriculum that adjusts in difficulty as the agent improves helps the agent encounter informative training signals. It can then gradually expand to harder problems as the policy improves.
+
+We propose an Elo-system~(\hyperlink{elo}{1}) extension to the basic difficulty-based curriculum approach, as outlined in Parashar et al.~(\hyperlink{paper:curriculum_sampling}{2}), which demonstrates that learning through curriculum stages requires fewer total samples than direct learning. We hypothesize that, instead of bucketing problems into trivial, easy, medium, and hard categories, using the Elo model to evaluate both agent and problem strength will achieve the following: \\ \\
+(1) improve RLOO sample efficiency, as measured by learning curves versus environment steps, and \\ \\
+(2) improve or at least match final pass@k on the Countdown test set compared to a uniform-sampling RLOO baseline. 
+
+Though Gaussian curriculum sampling achieves this effect, we're hoping the Elo model will provide more avenues for external analysis and more precise agent/problem pairings for the "teacher" to exploit ~(\hyperlink{paper:t_s}{3}). We will test this by comparing the default SFT, IPO, and RLOO baselines against one or more curriculum-based RLOO variants under comparable training budgets.
+
+\subsection{Related Work}
+
+Preference optimization methods such as DPO and IPO optimize language models using pairwise preference data without explicitly training a separate reward model. These approaches are attractive when human or model preferences are easier to obtain than calibrated scalar rewards, and they have become a standard component of modern post-training pipelines. However, preference-based objectives do not directly optimize task correctness and typically rely on offline data, which can limit their ability to exploit verifiable rewards on tasks like math and code.
+
+Online RL methods such as REINFORCE, PPO-style algorithms, and RLOO instead sample completions from the current policy and optimize against a scalar reward signal. In verifier-based domains, rule-based rewards can provide an objective measure of correctness by checking whether a completion satisfies problem-specific constraints (e.g., using the correct inputs and matching the target value). This makes Countdown a good setting for studying verifier-based RL fine-tuning of language models.
+
+Curriculum learning has been a hot topic of research recently, as evidenced by papers linked to the assignment spec from Meta, Deepseek, etc. Curriculum learning works by presenting training examples from easier to harder and helps especially in settings with sparse rewards or difficult exploration. For language-model reasoning tasks, prior work has explored staged or self-evolving curricula that adjust difficulty over time based on model performance or task properties. These ideas are particularly relevant for verifier-based RL, where early learning can be bottlenecked by a lack of successful trajectories. Our extension builds upon these founding father approaches of curriculum learning by using a simple rating system to assign a numerical "difficulty" value to problems and a numerical "strength" to the RL-based "student", which should improve the stability and efficiency of the "teacher" agent.
+
+\subsection{Technical Outline of Extension}
+
+The Elo system is a relative ranking system devised by Hungarian mathematician Arpad Elo and is most notably utilized in the chess ranking system. 
+We maintain a scalar rating $R_A$ for an RL agent $A$ and a scalar rating $R_P$ for a Countdown instance (or instance distribution) $P$. Ratings are updated from binary success on an episode; intermediate rewards from \texttt{evaluation/countdown.py} are used only to define success.
+
+\paragraph{Episode score.}
+Given an agent completion, our Countdown evaluator returns a reward
+\[
+r \in \{0.0,\;0.1,\;1.0\}.
+\]
+We convert this to a no-draw win/loss score for Elo updates:
+\[
+S_A \;=\; \mathbbm{1}[r = 1.0] \in \{0,1\}, 
+\qquad
+S_P \;=\; 1 - S_A.
+\]
+
+\paragraph{Expected success probability.}
+Define the expected probability that $A$ solves $P$ with the standard Elo logistic model:
+\[
+E_A \;=\; \frac{1}{1 + 10^{(R_P - R_A)/400}},
+\qquad
+E_P \;=\; 1 - E_A.
+\]
+
+\paragraph{Rating updates.}
+After one episode (or perhaps a batch of episodes), update agent and problem ratings by
+\[
+R_A' \;=\; R_A + K\,(S_A - E_A),
+\qquad
+R_P' \;=\; R_P + K\,(S_P - E_P)
+      \;=\; R_P - K\,(S_A - E_A),
+\]
+where $K$ is a tuneable step-size.
+
+
+We propose the following curriculum learning implementation:
+\begin{itemize}
+\item We initialize all agent and problem Elo ratings to 1500 and attempt to accurately initialize the Elo rating of the problems during the SFT warm-start stage.
+\item We then adopt the teacher/student framework from Sundaram et al., but with the additional Elo rating information for both student strength and problem difficulty. We sample problems according to the Gaussian sampling framework from Parashar et al. over Elo ratings of problems, iteratively shifting our distribution to get more difficult as the student progresses.
+\item We train both the teacher and the student with a nested loop, so that the teacher's recommendations improve over time. All the while, the Elo ratings of the problems and of the agent update according to successful/failed solution attempts.
+\end{itemize}
+
+The core technical contribution of our extension is the implementation of the Elo system on top of a curriculum sampler for RLOO. The sampler changes the training distribution over prompts while leaving the verifier, reward computation, and RLOO loss unchanged, which helps isolate the effect of data ordering on learning dynamics. We will evaluate the extension using pass@k metrics on the Countdown test set, rollout-level accuracy and verifier reward, and RLOO training diagnostics such as loss, KL penalty, and importance-weight statistics. Our main baselines will be the default SFT checkpoint, the IPO checkpoint, and the default RLOO checkpoint with uniform sampling. We will compare these against curriculum-based RLOO runs using the same model initialization, verifier, and evaluation dataset, and we will control for total environment interactions to study sample efficiency.
+
+\subsection{Citations}
+\begin{enumerate}
+  \item \hypertarget{elo}{}\textbf{Elo Wiki.}
+  https://en.wikipedia.org/wiki/Elo\_rating\_system
+  \item \hypertarget{paper:curriculum_sampling}{}\textbf{Probabilistic Curriculum Sampling.} Shubham Parashar et al. Curriculum reinforcement learning from easy to hard tasks improves
+llm reasoning. arXiv preprint arXiv:2506.06632, 2025.
+  \item \hypertarget{paper:t_s}{}\textbf{Teacher/Student Framework.} Shobhita Sundaram, John Quan, Ariel Kwiatkowski, Kartik Ahuja, Yann Ollivier, and Julia
+Kempe. Teaching models to teach themselves: Reasoning at the edge of learnability, 2026. URL
+https://arxiv.org/abs/2601.18778.
+\end{enumerate}
+\section{SFT Implementation}
+
+\subsection{Setup}
+
+For the first milestone, we implemented supervised fine-tuning for the required Qwen 2.5 0.5B base model. The SFT objective minimizes next-token cross-entropy only on completion tokens, with prompt tokens masked out of the loss.
+
+\begin{itemize}[leftmargin=*]
+    \item Base model: \texttt{Qwen/Qwen2.5-0.5B}
+    \item SFT dataset: \texttt{Asap7772/cog\_behav\_all\_strategies}
+    \item Evaluation dataset: \texttt{asingh15/countdown\_tasks\_3to4}
+    \item Learning rate: $5 \times 10^{-5}$
+    \item Epochs: 6
+    \item Batch size: 64
+    \item Gradient accumulation steps: 8
+    \item Gradient clipping: 1.0
+    \item Weight decay: 0.01
+    \item Warmup ratio: 0.05
+\end{itemize}
+
+The final SFT checkpoint was saved at:
+
+\begin{verbatim}
+/vol/checkpoints/sft_model/sft_default_project_0128/
+lr_5e-5_epochs_6_rerun_0501/model
+\end{verbatim}
+
+The corresponding Weights \& Biases run is:
+
+\begin{verbatim}
+https://wandb.ai/mtorre04-stanford-university/
+sft_default_project_0128/runs/oos4ws8w
+\end{verbatim}
+
+\subsection{Train and Test Curves}
+
+Figures~\ref{fig:sft_loss_curves} and~\ref{fig:sft_accuracy_curves} show the required SFT metrics (of SFT train/test loss and SFT train/test token accuracy) over training. Cross-entropy loss measures next-token negative log-likelihood on completion tokens, while token accuracy measures exact next-token prediction accuracy on those same response-token positions.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.48\linewidth]{train:loss.png}
+    \includegraphics[width=0.48\linewidth]{test:loss.png}
+    \caption{SFT cross-entropy loss on the train split (left) and test split (right).}
+    \label{fig:sft_loss_curves}
+\end{figure}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.48\linewidth]{train:token_accuracy.png}
+    \includegraphics[width=0.48\linewidth]{test:token_accuracy.png}
+    \caption{SFT token accuracy on the train split (left) and test split (right).}
+    \label{fig:sft_accuracy_curves}
+\end{figure}
+
+
+\subsection{Pass@k Evaluation}
+
+We evaluated the SFT checkpoint on the Countdown test split using 50 test prompts and 16 sampled responses per prompt. A response is counted as correct if it passes the rule-based Countdown verifier, meaning the answer is properly formatted, uses the provided numbers correctly, and evaluates to the target.
+
+\begin{table}[H]
+    \centering
+    \begin{tabular}{lc}
+        \toprule
+        Metric & Value \\
+        \midrule
+        pass@1 & 0.36 \\
+        pass@2 & 0.44 \\
+        pass@4 & 0.54 \\
+        pass@8 & 0.68 \\
+        pass@16 & 0.78 \\
+        \bottomrule
+    \end{tabular}
+    \caption{Pass@k evaluation for the SFT checkpoint on the Countdown test set.}
+    \label{tab:passk}
+\end{table}
+Across all 800 sampled rollouts, the sample-level exact correctness was 0.31125 and the mean verifier score was 0.37050.
+
+
+\subsection{Sample Completion}
+
+Below is one successful test-set completion from the SFT model.
+
+\begin{quote}
+\textbf{Target:} 98
+
+\textbf{Numbers:} [44, 19, 35]
+
+\textbf{Model output:}
+\begin{verbatim}
+<think>
+Let me try to find a path to 98.
+44 + 35 = 79
+79 + 19 = 98
+</think>
+<answer>(44 + 35) + 19</answer>
+\end{verbatim}
+\end{quote}
+
+This completion is correct because it uses each provided number once and evaluates to the target:
+\[
+(44 + 35) + 19 = 98.
+\]
+
+\subsection{Artifacts}
+
+The trained SFT checkpoint is stored on the Modal volume at:
+
+\begin{verbatim}
+/vol/checkpoints/sft_model/sft_default_project_0128/
+lr_5e-5_epochs_6_rerun_0501/model
+\end{verbatim}
+
+The generated evaluation JSON should be submitted separately to the Gradescope evaluation artifact assignment.
+
+\section{Team Contributions}
+
+\subsection{Individual Member Contributions}
+
+\textbf{Matthew Torre} will be responsible for the SFT training pipeline, including dataset preprocessing, hyperparameter selection, and experiment tracking via Weights \& Biases. He will also lead the design and implementation of the Elo-based curriculum extension for RLOO, including the Elo rating system for agent--problem pairs and the Gaussian-weighted sampling strategy.
+
+\textbf{Donnie Raymond} will lead the IPO implementation and its integration into the shared training framework. He will conduct baseline comparisons across SFT, IPO, and default RLOO, and will be primarily responsible for analyzing train/test loss and token accuracy curves. He will also take the lead on writing and structuring the final report.
+
+Both members will contribute jointly to the overall experimental design, ablation studies, and presentation of results.
+
+\end{document}
