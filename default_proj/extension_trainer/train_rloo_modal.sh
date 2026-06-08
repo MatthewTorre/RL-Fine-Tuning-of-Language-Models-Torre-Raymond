@@ -49,6 +49,15 @@ temperature="${TEMPERATURE:-1.0}"
 top_k="${TOP_K:--1}"
 top_p="${TOP_P:-1.0}"
 min_p="${MIN_P:-0.0}"
+train_dataset_fraction="${TRAIN_DATASET_FRACTION:-}"
+train_max_examples="${TRAIN_MAX_EXAMPLES:-}"
+train_subset_seed="${TRAIN_SUBSET_SEED:-0}"
+train_subset_strategy="${TRAIN_SUBSET_STRATEGY:-first}"
+elo_heuristic_bootstrap="${ELO_HEURISTIC_BOOTSTRAP:-0}"
+elo_heuristic_base_rating="${ELO_HEURISTIC_BASE_RATING:-1500.0}"
+elo_heuristic_scale="${ELO_HEURISTIC_SCALE:-200.0}"
+elo_heuristic_min_rating="${ELO_HEURISTIC_MIN_RATING:-1200.0}"
+elo_heuristic_max_rating="${ELO_HEURISTIC_MAX_RATING:-1800.0}"
 
 tokenizer_name="${TOKENIZER_NAME:-Qwen/Qwen2.5-0.5B}"
 model_name="${MODEL_NAME:-asingh15/qwen-sft-countdown-defaultproj}"
@@ -86,6 +95,28 @@ command=(
     --min_p "$min_p"
     --disable_elo_bootstrap_with_sft
 )
+
+if [[ -n "$train_dataset_fraction" ]]; then
+    command+=(--train_dataset_fraction "$train_dataset_fraction")
+fi
+if [[ -n "$train_max_examples" ]]; then
+    command+=(--train_max_examples "$train_max_examples")
+fi
+if [[ -n "${TRAIN_SUBSET_SEED:-}" ]]; then
+    command+=(--train_subset_seed "$train_subset_seed")
+fi
+if [[ -n "${TRAIN_SUBSET_STRATEGY:-}" ]]; then
+    command+=(--train_subset_strategy "$train_subset_strategy")
+fi
+if [[ "$elo_heuristic_bootstrap" == "1" || "$elo_heuristic_bootstrap" == "true" || "$elo_heuristic_bootstrap" == "True" ]]; then
+    command+=(
+        --elo_heuristic_bootstrap
+        --elo_heuristic_base_rating "$elo_heuristic_base_rating"
+        --elo_heuristic_scale "$elo_heuristic_scale"
+        --elo_heuristic_min_rating "$elo_heuristic_min_rating"
+        --elo_heuristic_max_rating "$elo_heuristic_max_rating"
+    )
+fi
 
 printf 'Executing command: '
 printf '%q ' "${command[@]}"

@@ -26,7 +26,7 @@ def success_fraction(group_rewards: list[float] | np.ndarray) -> float:
 class EloCurriculumConfig:
     """Hyperparameters controlling Elo updates and curriculum sampling."""
 
-    initial_agent_rating: float = 1340.0
+    initial_agent_rating: float = 1400.0
     initial_problem_rating: float = 1500.0
     k_agent: float = 32.0
     k_problem_base: float = 800.0
