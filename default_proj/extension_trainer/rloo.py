@@ -30,6 +30,7 @@ from extension_trainer.elo_curriculum import (
     load_problem_ratings,
     success_fraction,
 )
+from extension_trainer.heuristic_elo import compute_heuristic_problem_ratings
 from extension_trainer.sampling_worker import SamplingWorker
 from extension_trainer.rloo_update_worker import RLOOUpdateWorker
 from extension_trainer.rloo_dataset import get_dataloaders
@@ -47,6 +48,10 @@ class RLOOTrainer:
         ref_model_name=None,
         tokenizer_name=None,
         dataset_name='asingh15/countdown_tasks_3to4',
+        train_dataset_fraction=None,
+        train_max_examples=None,
+        train_subset_seed=0,
+        train_subset_strategy='first',
         wandb_project='rloo_default_project',
         wandb_name='test',
         lr_schedule='constant',
@@ -57,7 +62,7 @@ class RLOOTrainer:
         group_size=2, 
         entropy_coefficient=0.01, 
         kl_divergence_coefficient=0.0,
-        num_epochs=10,
+        num_epochs=20,
         gradient_accumulation_steps=1,
         gradient_clipping=1.0,
         temperature=1.0,
@@ -75,7 +80,7 @@ class RLOOTrainer:
         save_every_n_steps=-1,
         save_dir='checkpoints/rloo_checkpoints',
         curriculum_type='elo_gaussian',
-        elo_initial_agent_rating=1340.0,
+        elo_initial_agent_rating=1400.0,
         elo_initial_problem_rating=1500.0,
         elo_k_agent=32.0,
         elo_k_problem_base=800.0,
@@ -87,11 +92,20 @@ class RLOOTrainer:
         elo_bootstrap_with_sft=True,
         elo_bootstrap_model_path=None,
         elo_bootstrap_epsilon=1e-3,
+        elo_heuristic_bootstrap=False,
+        elo_heuristic_base_rating=1500.0,
+        elo_heuristic_scale=200.0,
+        elo_heuristic_min_rating=1200.0,
+        elo_heuristic_max_rating=1800.0,
     ):
         self.model_name = model_name
         self.ref_model_name = self.model_name if ref_model_name is None else ref_model_name
         self.tokenizer_name = tokenizer_name if tokenizer_name is not None else model_name
         self.dataset_name = dataset_name
+        self.train_dataset_fraction = train_dataset_fraction
+        self.train_max_examples = train_max_examples
+        self.train_subset_seed = train_subset_seed
+        self.train_subset_strategy = train_subset_strategy
         self.wandb_project = wandb_project
         self.wandb_name = wandb_name
         self.lr_schedule = lr_schedule
@@ -134,6 +148,11 @@ class RLOOTrainer:
         self.elo_bootstrap_with_sft = elo_bootstrap_with_sft
         self.elo_bootstrap_model_path = elo_bootstrap_model_path
         self.elo_bootstrap_epsilon = elo_bootstrap_epsilon
+        self.elo_heuristic_bootstrap = elo_heuristic_bootstrap
+        self.elo_heuristic_base_rating = elo_heuristic_base_rating
+        self.elo_heuristic_scale = elo_heuristic_scale
+        self.elo_heuristic_min_rating = elo_heuristic_min_rating
+        self.elo_heuristic_max_rating = elo_heuristic_max_rating
         
         # DataLoader yields prompts + ground-truth metadata only.
         dataloaders = get_dataloaders(
@@ -141,9 +160,20 @@ class RLOOTrainer:
             splits=['train', 'test'], 
             batch_size=self.batch_size, 
             num_proc=4,
+            train_fraction=self.train_dataset_fraction,
+            train_max_examples=self.train_max_examples,
+            train_subset_seed=self.train_subset_seed,
+            train_subset_strategy=self.train_subset_strategy,
         )
         self.train_dataloader, self.test_dataloader = dataloaders['train'], dataloaders['test']
         self.train_dataset = self.train_dataloader.dataset
+        print(
+            "Loaded train dataset: "
+            f"{len(self.train_dataset)}/{self.train_dataset.original_size} examples "
+            f"(fraction={self.train_dataset_fraction}, max_examples={self.train_max_examples}, "
+            f"strategy={self.train_subset_strategy})"
+        )
+        print(f"Loaded test dataset: {len(self.test_dataloader.dataset)} examples")
         
         # Initialize actor references as None - will be created on demand
         self.sampling_worker = None
@@ -173,6 +203,8 @@ class RLOOTrainer:
 
         num_problems = len(self.train_dataset)
         initial_problem_ratings = load_problem_ratings(self.elo_bootstrap_path, num_problems)
+        if initial_problem_ratings is None and self.elo_heuristic_bootstrap:
+            initial_problem_ratings = self._heuristic_problem_ratings()
         if initial_problem_ratings is None and self.elo_bootstrap_with_sft:
             bootstrap_model_path = self.elo_bootstrap_model_path or self.model_name
             initial_problem_ratings = self._bootstrap_problem_ratings(bootstrap_model_path)
@@ -190,6 +222,23 @@ class RLOOTrainer:
             config=config,
             initial_problem_ratings=initial_problem_ratings,
         )
+
+    def _heuristic_problem_ratings(self):
+        """Initialize problem Elo ratings from cheap input-only Countdown features."""
+        print("Initializing problem Elo ratings with input-only heuristic.")
+        ratings = compute_heuristic_problem_ratings(
+            self.train_dataset,
+            base_rating=self.elo_heuristic_base_rating,
+            scale=self.elo_heuristic_scale,
+            min_rating=self.elo_heuristic_min_rating,
+            max_rating=self.elo_heuristic_max_rating,
+        )
+        print(
+            "Heuristic problem Elo ratings "
+            f"(mean={ratings.mean():.2f}, std={ratings.std():.2f}, "
+            f"min={ratings.min():.2f}, max={ratings.max():.2f})"
+        )
+        return ratings
 
     def _bootstrap_problem_ratings(self, model_path):
         """Initialize problem Elo ratings from SFT checkpoint solve rates."""
@@ -527,6 +576,10 @@ if __name__ == "__main__":
     parser.add_argument('--ref_model_name', type=str, default=None)
     parser.add_argument('--tokenizer_name', type=str, default=None)
     parser.add_argument('--dataset_name', type=str, default='asingh15/countdown_tasks_3to4')
+    parser.add_argument('--train_dataset_fraction', type=float, default=None)
+    parser.add_argument('--train_max_examples', type=int, default=None)
+    parser.add_argument('--train_subset_seed', type=int, default=0)
+    parser.add_argument('--train_subset_strategy', type=str, default='first', choices=('first', 'random'))
     parser.add_argument('--wandb_project', type=str, default='rloo_default_project')
     parser.add_argument('--wandb_name', type=str, default='test')
     parser.add_argument('--lr_schedule', type=str, default='constant')
@@ -555,7 +608,7 @@ if __name__ == "__main__":
     parser.add_argument('--save_every_n_steps', type=int, default=-1) # -1 means don't save every n steps
     parser.add_argument('--save_dir', type=str, default='checkpoints/extension_checkpoints')
     parser.add_argument('--curriculum_type', type=str, default='elo_gaussian', choices=('uniform', 'elo_gaussian'))
-    parser.add_argument('--elo_initial_agent_rating', type=float, default=1340.0)
+    parser.add_argument('--elo_initial_agent_rating', type=float, default=1400.0)
     parser.add_argument('--elo_initial_problem_rating', type=float, default=1500.0)
     parser.add_argument('--elo_k_agent', type=float, default=32.0)
     parser.add_argument('--elo_k_problem_base', type=float, default=800.0)
@@ -568,6 +621,11 @@ if __name__ == "__main__":
     parser.add_argument('--disable_elo_bootstrap_with_sft', action='store_true')
     parser.add_argument('--elo_bootstrap_model_path', type=str, default=None)
     parser.add_argument('--elo_bootstrap_epsilon', type=float, default=1e-3)
+    parser.add_argument('--elo_heuristic_bootstrap', action='store_true')
+    parser.add_argument('--elo_heuristic_base_rating', type=float, default=1500.0)
+    parser.add_argument('--elo_heuristic_scale', type=float, default=200.0)
+    parser.add_argument('--elo_heuristic_min_rating', type=float, default=1200.0)
+    parser.add_argument('--elo_heuristic_max_rating', type=float, default=1800.0)
     args = parser.parse_args()
     if args.model_path is not None:
         args.model_name = args.model_path

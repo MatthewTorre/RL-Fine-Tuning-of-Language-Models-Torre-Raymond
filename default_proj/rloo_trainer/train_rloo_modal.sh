@@ -51,8 +51,8 @@ top_p="${TOP_P:-1.0}"
 min_p="${MIN_P:-0.0}"
 
 tokenizer_name="${TOKENIZER_NAME:-Qwen/Qwen2.5-0.5B}"
-model_name="${MODEL_NAME:-your-org/your-model}"
-dataset_name="${DATASET_NAME:-your-org/your-dataset}"
+model_name="${MODEL_NAME:-asingh15/qwen-sft-countdown-defaultproj}"
+dataset_name="${DATASET_NAME:-asingh15/countdown_tasks_3to4}"
 wandb_project="${WANDB_PROJECT:-rloo_training}"
 save_dir="${SAVE_DIR:-/vol/checkpoints/rloo_checkpoints}"
 
